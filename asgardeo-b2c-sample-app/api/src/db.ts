@@ -8,7 +8,56 @@ const dbPath = resolve(__dirname, "..", "wayfinder.sqlite");
 
 let db;
 
+/**
+ * A booking named an item that is not in the catalogue. Agents invent
+ * plausible-looking IDs, so this is a routine rejection rather than a fault:
+ * callers map it to 400 so the model can retry with an ID from a search.
+ */
+export class UnknownBookingItemError extends Error {
+  statusCode = 400;
+
+  constructor(type, itemId) {
+    super(`Unknown ${type} ID: ${itemId}. Use an ID returned by a search.`);
+    this.name = "UnknownBookingItemError";
+  }
+}
+
+/**
+ * Tables `npm run seed` builds from schema.sql. `ensureSchema` cannot create
+ * them itself -- it has no catalogue data to put in them, and an empty flights
+ * table would leave every search silently returning nothing.
+ */
+const CATALOGUE_TABLES = ["flights", "hotels", "trips"];
+
+/**
+ * The bookings_reject_unknown_item_* triggers read the catalogue tables.
+ * SQLite accepts a trigger that names a missing table and only fails when the
+ * trigger fires, so an unseeded database would reach the first booking and
+ * report `no such table: main.flights`. Check up front instead, so the error
+ * names the fix at startup.
+ */
+function assertCatalogueTables(database) {
+  const present = new Set(
+    database
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all()
+      .map((row) => row.name)
+  );
+  const missing = CATALOGUE_TABLES.filter((table) => !present.has(table));
+
+  if (missing.length > 0) {
+    const label = missing.length === 1 ? "table" : "tables";
+
+    throw new Error(
+      `SQLite database is missing the ${missing.join(", ")} ${label}. ` +
+      "Run `npm run seed` from the api directory."
+    );
+  }
+}
+
 function ensureSchema(database) {
+  assertCatalogueTables(database);
+
   database.exec(`
     CREATE TABLE IF NOT EXISTS bookings (
       id TEXT PRIMARY KEY,
@@ -20,7 +69,9 @@ function ensureSchema(database) {
       travelers INTEGER NOT NULL,
       booking_price REAL,
       status TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      booked_by_agent_id TEXT,
+      booked_by_agent_name TEXT
     );
 
     CREATE TABLE IF NOT EXISTS deal_alert_consents (
@@ -37,6 +88,37 @@ function ensureSchema(database) {
       FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE
     );
 
+    -- bookings.item_id is polymorphic, so it cannot take a foreign key. These
+    -- triggers are the equivalent guard: a booking may only point at a catalogue
+    -- row that exists, whichever writer inserts it.
+    CREATE TRIGGER IF NOT EXISTS bookings_reject_unknown_item_insert
+    BEFORE INSERT ON bookings
+    FOR EACH ROW
+    WHEN NOT EXISTS (
+      SELECT 1 FROM flights WHERE NEW.type = 'flight' AND flights.id = NEW.item_id
+      UNION ALL
+      SELECT 1 FROM hotels WHERE NEW.type = 'hotel' AND hotels.id = NEW.item_id
+      UNION ALL
+      SELECT 1 FROM trips WHERE NEW.type = 'trip' AND trips.id = NEW.item_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bookings.item_id does not match a known flight, hotel or trip');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS bookings_reject_unknown_item_update
+    BEFORE UPDATE OF type, item_id ON bookings
+    FOR EACH ROW
+    WHEN NOT EXISTS (
+      SELECT 1 FROM flights WHERE NEW.type = 'flight' AND flights.id = NEW.item_id
+      UNION ALL
+      SELECT 1 FROM hotels WHERE NEW.type = 'hotel' AND hotels.id = NEW.item_id
+      UNION ALL
+      SELECT 1 FROM trips WHERE NEW.type = 'trip' AND trips.id = NEW.item_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bookings.item_id does not match a known flight, hotel or trip');
+    END;
+
     CREATE TRIGGER IF NOT EXISTS delete_deal_alert_consents_after_booking_delete
     AFTER DELETE ON bookings
     FOR EACH ROW
@@ -46,9 +128,11 @@ function ensureSchema(database) {
     END;
   `);
 
-  const bookingColumns = database.prepare("PRAGMA table_info(bookings)").all();
+  const bookingColumns = database.prepare("PRAGMA table_info(bookings)").all() as { name: string }[];
   const hasBookingReference = bookingColumns.some((column) => column.name === "booking_reference");
   const hasBookingPrice = bookingColumns.some((column) => column.name === "booking_price");
+  const hasBookedByAgentId = bookingColumns.some((column) => column.name === "booked_by_agent_id");
+  const hasBookedByAgentName = bookingColumns.some((column) => column.name === "booked_by_agent_name");
 
   if (!hasBookingReference) {
     database.exec("ALTER TABLE bookings ADD COLUMN booking_reference TEXT;");
@@ -56,6 +140,14 @@ function ensureSchema(database) {
 
   if (!hasBookingPrice) {
     database.exec("ALTER TABLE bookings ADD COLUMN booking_price REAL;");
+  }
+
+  if (!hasBookedByAgentId) {
+    database.exec("ALTER TABLE bookings ADD COLUMN booked_by_agent_id TEXT;");
+  }
+
+  if (!hasBookedByAgentName) {
+    database.exec("ALTER TABLE bookings ADD COLUMN booked_by_agent_name TEXT;");
   }
 
   const dealAlertColumns = database.prepare("PRAGMA table_info(deal_alert_consents)").all();
@@ -278,6 +370,40 @@ export function findFlightById(id) {
   return row ? mapFlight(row) : null;
 }
 
+export function findHotelById(id) {
+  const row = getDatabase()
+    .prepare("SELECT * FROM hotels WHERE id = @id")
+    .get({ id });
+
+  return row ? mapHotel(row) : null;
+}
+
+function findTripById(id) {
+  return getDatabase()
+    .prepare("SELECT * FROM trips WHERE id = @id")
+    .get({ id }) || null;
+}
+
+/**
+ * Resolve the catalogue row a booking points at, or reject the booking.
+ * `bookings.item_id` is polymorphic, so the lookup is per type; the
+ * `bookings_reject_unknown_item_*` triggers enforce the same rule in SQL for
+ * any writer that does not come through here.
+ */
+function findBookingItem(type, itemId) {
+  const item =
+    type === "flight" ? findFlightById(itemId) :
+    type === "hotel" ? findHotelById(itemId) :
+    type === "trip" ? findTripById(itemId) :
+    null;
+
+  if (!item) {
+    throw new UnknownBookingItemError(type, itemId);
+  }
+
+  return item;
+}
+
 export function createFlightRecord({
   id,
   from,
@@ -450,10 +576,14 @@ export function createBookingRecord({
   itemId,
   travelers,
   status,
-  createdAt
+  createdAt,
+  // Supplied only by the MCP write path, from the verified delegated token.
+  bookedByAgentId = null,
+  bookedByAgentName = null
 }) {
   const username = user.username || user.email || user.id;
-  const item = type === "flight" ? findFlightById(itemId) : null;
+  const item = findBookingItem(type, itemId);
+  const bookingPrice = type === "flight" ? item.price : null;
 
   getDatabase()
     .prepare(
@@ -468,7 +598,9 @@ export function createBookingRecord({
           travelers,
           booking_price,
           status,
-          created_at
+          created_at,
+          booked_by_agent_id,
+          booked_by_agent_name
         ) VALUES (
           @id,
           @bookingReference,
@@ -479,7 +611,9 @@ export function createBookingRecord({
           @travelers,
           @bookingPrice,
           @status,
-          @createdAt
+          @createdAt,
+          @bookedByAgentId,
+          @bookedByAgentName
         )
       `
     )
@@ -491,9 +625,11 @@ export function createBookingRecord({
       type,
       itemId,
       travelers,
-      bookingPrice: item?.price ?? null,
+      bookingPrice,
       status,
-      createdAt
+      createdAt,
+      bookedByAgentId,
+      bookedByAgentName
     });
 
   return {
@@ -504,9 +640,11 @@ export function createBookingRecord({
     type,
     itemId,
     travelers,
-    bookingPrice: item?.price ?? null,
+    bookingPrice,
     status,
-    createdAt
+    createdAt,
+    bookedByAgentId,
+    bookedByAgentName
   };
 }
 
@@ -560,6 +698,8 @@ export function listBookedFlights(username) {
           bookings.booking_price,
           bookings.status,
           bookings.created_at,
+          bookings.booked_by_agent_id,
+          bookings.booked_by_agent_name,
           flights.*
         FROM bookings
         INNER JOIN flights ON bookings.item_id = flights.id
@@ -577,6 +717,8 @@ export function listBookedFlights(username) {
     travelers: row.travelers,
     status: row.status,
     createdAt: row.created_at,
+    bookedByAgentId: row.booked_by_agent_id,
+    bookedByAgentName: row.booked_by_agent_name,
     flight: {
       ...mapFlight(row),
       price: row.booking_price ?? row.price
@@ -596,6 +738,8 @@ export function getBookedFlightById(bookingId) {
           bookings.booking_price,
           bookings.status,
           bookings.created_at,
+          bookings.booked_by_agent_id,
+          bookings.booked_by_agent_name,
           flights.*
         FROM bookings
         INNER JOIN flights ON bookings.item_id = flights.id
@@ -617,6 +761,8 @@ export function getBookedFlightById(bookingId) {
     travelers: row.travelers,
     status: row.status,
     createdAt: row.created_at,
+    bookedByAgentId: row.booked_by_agent_id,
+    bookedByAgentName: row.booked_by_agent_name,
     flight: {
       ...mapFlight(row),
       price: row.booking_price ?? row.price

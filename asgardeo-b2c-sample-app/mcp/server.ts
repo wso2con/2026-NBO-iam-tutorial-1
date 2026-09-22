@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { resolveAgentName } from "./agents.js";
 import {
     AuthError,
     requireScope,
@@ -78,7 +79,9 @@ function loadEnvFile(filePath: string) {
 
 loadEnvFile(resolve(__dirname, ".env"));
 
-const port = Number(process.env.PORT || process.env.MCP_PORT || 8000);
+// MCP_PORT wins over the generic PORT: api/.env sets PORT=8787, and a shell that has
+// sourced it would otherwise bind this server on top of the API.
+const port = Number(process.env.MCP_PORT || process.env.PORT || 8000);
 const host = process.env.HOST || "localhost";
 const requireAuth = process.env.MCP_REQUIRE_AUTH === "true";
 
@@ -237,6 +240,16 @@ function createTravelMcpServer(authorization?: string, requestLogger: Logger = l
         };
     }
 
+    /** The agent acting for the user, or null unless the token is delegated. */
+    function getBookingAgent(claims: VerifiedClaims) {
+        const agentId = claims.delegated ? claims.actor ?? null : null;
+
+        return {
+            bookedByAgentId: agentId,
+            bookedByAgentName: resolveAgentName(agentId),
+        };
+    }
+
     // Public catalogue reads. A valid token is still required when
     // MCP_REQUIRE_AUTH=true, but no scope beyond that.
     server.tool(
@@ -296,17 +309,29 @@ function createTravelMcpServer(authorization?: string, requestLogger: Logger = l
         withAuthorization(
             getClaims,
             scopesForTool("create_booking"),
-            async ({ type, itemId, travelers }, claims) => logToolOperation(
-                requestLogger,
-                "create_booking",
-                { type, itemId, travelers, subject: claims.subject },
-                async () => toToolContent(await createBooking({
-                    owner: getOwner(claims),
-                    type,
-                    itemId,
-                    travelers: travelers ?? 1,
-                }) as JsonValue),
-            ),
+            async ({ type, itemId, travelers }, claims) => {
+                const agent = getBookingAgent(claims);
+
+                return logToolOperation(
+                    requestLogger,
+                    "create_booking",
+                    {
+                        type,
+                        itemId,
+                        travelers,
+                        subject: claims.subject,
+                        bookedByAgentId: agent.bookedByAgentId,
+                        bookedByAgentName: agent.bookedByAgentName,
+                    },
+                    async () => toToolContent(await createBooking({
+                        owner: getOwner(claims),
+                        type,
+                        itemId,
+                        travelers: travelers ?? 1,
+                        ...agent,
+                    }) as JsonValue),
+                );
+            },
         ),
     );
 

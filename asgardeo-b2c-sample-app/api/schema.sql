@@ -53,7 +53,10 @@ CREATE TABLE bookings (
   travelers INTEGER NOT NULL,
   booking_price REAL,
   status TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- NULL when the user booked it themselves; set only on the MCP write path.
+  booked_by_agent_id TEXT,
+  booked_by_agent_name TEXT
 );
 
 CREATE TABLE deal_alert_consents (
@@ -69,6 +72,37 @@ CREATE TABLE deal_alert_consents (
   UNIQUE (booking_id, username),
   FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE
 );
+
+-- bookings.item_id is polymorphic, so it cannot take a foreign key. These
+-- triggers are the equivalent guard: a booking may only point at a catalogue
+-- row that exists, whichever writer inserts it.
+CREATE TRIGGER bookings_reject_unknown_item_insert
+BEFORE INSERT ON bookings
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM flights WHERE NEW.type = 'flight' AND flights.id = NEW.item_id
+  UNION ALL
+  SELECT 1 FROM hotels WHERE NEW.type = 'hotel' AND hotels.id = NEW.item_id
+  UNION ALL
+  SELECT 1 FROM trips WHERE NEW.type = 'trip' AND trips.id = NEW.item_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'bookings.item_id does not match a known flight, hotel or trip');
+END;
+
+CREATE TRIGGER bookings_reject_unknown_item_update
+BEFORE UPDATE OF type, item_id ON bookings
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM flights WHERE NEW.type = 'flight' AND flights.id = NEW.item_id
+  UNION ALL
+  SELECT 1 FROM hotels WHERE NEW.type = 'hotel' AND hotels.id = NEW.item_id
+  UNION ALL
+  SELECT 1 FROM trips WHERE NEW.type = 'trip' AND trips.id = NEW.item_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'bookings.item_id does not match a known flight, hotel or trip');
+END;
 
 CREATE TRIGGER delete_deal_alert_consents_after_booking_delete
 AFTER DELETE ON bookings
